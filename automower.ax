@@ -1,0 +1,419 @@
+# @name    Automower
+# @desc    Husqvarna Automower 410XE NERA Live Diorama & Status
+# @author  awtrix-ng
+# @version 1.3
+# @display 52x16
+# @config  app_key    text   "App Key (Client ID)"    default="" group="Husqvarna API" help="Application Key from the Husqvarna Developer Portal"
+# @config  app_secret text   "App Secret"             default="" group="Husqvarna API" help="Application Secret from the Husqvarna Developer Portal"
+# @config  mower_name text   "Mower Name (optional)"  default="" group="Husqvarna API" help="Leave empty to use the first mower in the account"
+# @config  every      number "Poll Interval"          default=5 min=1 max=60 unit=min group="Husqvarna API" help="5 min recommended (API limit: 10,000/month)"
+# @config  show_next  bool   "Show Next Start"        default=true group="Display"
+# @config  err_notify bool   "Alert on Error"         default=true group="Display" help="Wakes up the display when a mower error occurs"
+# @config  anim_spd   slider "Animation Speed"        default=100 min=25 max=200 unit=% group="Design"
+# @config  body_col   color  "Mower Accent Color"     default=#FF6600 group="Design"
+# @config  grass_col  color  "Grass Color"            default=#00AA22 group="Design"
+
+import math
+import string
+
+class Automower
+  var app_key, app_secret, mower_filter
+  var period, show_next, err_notify, spd, body_col, grass_col, txt_col
+  var token, tok_ttl, ticks, in_flight
+  var bat, st_id, err_code, last_err, next_str, m_name
+  var bat_str, line2, st_col, sc_opts
+
+  def init()
+    self.app_key = string.tr(store.get("app_key"), " \t\r\n", "")
+    self.app_secret = string.tr(store.get("app_secret"), " \t\r\n", "")
+    self.mower_filter = store.get("mower_name")
+    self.period = store.get("every") * 60
+    self.show_next = store.get("show_next")
+    self.err_notify = store.get("err_notify")
+    self.spd = store.get("anim_spd")
+    self.body_col = store.get("body_col")
+    self.grass_col = store.get("grass_col")
+    var tc = settings.get("textColor")
+    self.txt_col = tc != nil ? tc : 0xFFFFFF
+
+    self.token = nil
+    self.tok_ttl = 0
+    self.ticks = 0
+    self.in_flight = false
+
+    self.bat = store.get("bat")
+    self.st_id = store.get("st_id")
+    if self.st_id == nil self.st_id = 0 end
+    self.err_code = 0
+    self.last_err = 0
+    self.next_str = store.get("next_str")
+    self.m_name = store.get("m_name")
+    if self.m_name == nil self.m_name = "NERA" end
+
+    self.sc_opts = {"speed": 85, "gap": 10}
+    self.bat_str = self.bat != nil ? str(self.bat) + "%" : "--%"
+    self.st_col = self.txt_col
+
+    if self.app_key == "" || self.app_secret == ""
+      self.line2 = "SET API KEY IN WEB UI"
+      self.st_col = 0xFFAA00
+    else
+      var saved = store.get("line2")
+      if saved != nil && saved != "CONNECTING..." && saved != "VERBINDE..."
+        self.line2 = saved
+      else
+        self.line2 = "STARTING..."
+      end
+    end
+  end
+
+  def on_token(body, status)
+    self.in_flight = false
+    if status != 200 || body == nil
+      log("Automower Auth Error: HTTP " + str(status) + " Body: " + str(body))
+      if status == 0
+        self.line2 = "NET ERR (TLS/DNS)"
+      elif status == 400 || status == 401
+        self.line2 = "BAD KEY/SECRET (" + str(status) + ")"
+      else
+        self.line2 = "AUTH HTTP " + str(status)
+      end
+      self.st_col = 0xFF2222
+      self.ticks = 30
+      return
+    end
+
+    var m = re.search("\"access_token\"\\s*:\\s*\"([^\"]+)\"", body)
+    if m == nil
+      log("Automower Token Parse Error: " + str(body))
+      self.line2 = "TOKEN PARSE ERR"
+      self.st_col = 0xFF2222
+      self.ticks = 30
+      return
+    end
+
+    self.token = m[1]
+    var ex = re.search("\"expires_in\"\\s*:\\s*(\\d+)", body)
+    self.tok_ttl = ex != nil ? num(ex[1], 3600) - 120 : 3600
+    self.line2 = "2/2 LOADING..."
+    self.st_col = 0x00CCFF
+    self.ticks = 0
+  end
+
+  def on_mower(body, status)
+    self.in_flight = false
+    if status == 401
+      log("Automower Token expired (401), refreshing...")
+      self.token = nil
+      self.tok_ttl = 0
+      self.ticks = 2
+      return
+    end
+    if status == 403
+      log("Automower 403 Forbidden: Is Automower Connect API connected in Portal?")
+      self.line2 = "403 API NOT LINKED"
+      self.st_col = 0xFF2222
+      self.ticks = 60
+      return
+    end
+    if status != 200 || body == nil
+      log("Automower Request Error: HTTP " + str(status))
+      self.line2 = "API HTTP " + str(status)
+      self.st_col = 0xFF2222
+      self.ticks = 30
+      return
+    end
+
+    var work = body
+    if self.mower_filter != nil && self.mower_filter != ""
+      var mf = re.search("\"name\"\\s*:\\s*\"" + self.mower_filter + "[\\s\\S]*", body)
+      if mf != nil work = mf[0] end
+    end
+
+    var mn = re.search("\"name\"\\s*:\\s*\"([^\"]+)\"", work)
+    if mn == nil
+      log("Automower: No mower found in account: " + str(body))
+      self.line2 = "NO MOWER FOUND"
+      self.st_col = 0xFFAA00
+      return
+    end
+    self.m_name = mn[1]
+
+    var mb = re.search("\"batteryPercent\"\\s*:\\s*(\\d+)", work)
+    if mb != nil
+      self.bat = clamp(num(mb[1], 0), 0, 100)
+      self.bat_str = str(self.bat) + "%"
+      store.set("bat", self.bat)
+    end
+
+    var ma = re.search("\"activity\"\\s*:\\s*\"([A-Z_]+)\"", work)
+    var act = ma != nil ? ma[1] : "UNKNOWN"
+    var ms = re.search("\"state\"\\s*:\\s*\"([A-Z_]+)\"", work)
+    var st = ms != nil ? ms[1] : "UNKNOWN"
+    var mi = re.search("\"inactiveReason\"\\s*:\\s*\"([A-Z_]+)\"", work)
+    var inact = mi != nil ? mi[1] : "NONE"
+    var mr = re.search("\"restrictedReason\"\\s*:\\s*\"([A-Z_]+)\"", work)
+    var restr = mr != nil ? mr[1] : "NONE"
+    var me = re.search("\"errorCode\"\\s*:\\s*(\\d+)", work)
+    self.err_code = me != nil ? num(me[1], 0) : 0
+
+    var mnxt = re.search("\"nextStartTimestamp\"\\s*:\\s*(\\d+)\\d\\d\\d", work)
+    if mnxt != nil
+      var sec = num(mnxt[1], 0)
+      if sec > 0
+        var sod = sec % 86400
+        var nh = sod / 3600
+        var nm = (sod % 3600) / 60
+        self.next_str = (nh < 10 ? "0" : "") + str(nh) + ":" + (nm < 10 ? "0" : "") + str(nm)
+      else
+        self.next_str = nil
+      end
+    else
+      self.next_str = nil
+    end
+
+    var label = "READY"
+    self.st_col = self.txt_col
+
+    if st == "ERROR" || st == "FATAL_ERROR" || st == "ERROR_AT_POWER_UP" || act == "STOPPED_IN_GARDEN" || self.err_code > 0
+      self.st_id = 6
+      label = self.err_code > 0 ? "ERROR E" + str(self.err_code) : "STOPPED"
+      self.st_col = 0xFF2222
+      if self.err_notify && self.err_code > 0 && self.err_code != self.last_err
+        self.last_err = self.err_code
+        notify({"text": self.m_name + ": " + label, "textColor": 0xFF2222, "wakeup": true})
+      end
+    elif inact == "SEARCHING_FOR_SATELLITES" || inact == "PLANNING"
+      self.st_id = 5
+      label = inact == "PLANNING" ? "PLANNING" : "EPOS GPS"
+      self.st_col = 0x00DDFF
+    elif act == "MOWING"
+      self.st_id = 1
+      label = "MOWING · " + self.m_name
+      self.st_col = 0x22FF44
+      self.last_err = 0
+    elif act == "GOING_HOME"
+      self.st_id = 2
+      label = "GOING HOME"
+      self.st_col = 0xFFAA00
+    elif act == "LEAVING"
+      self.st_id = 3
+      label = "LEAVING"
+      self.st_col = 0x00FFAA
+    elif act == "CHARGING"
+      self.st_id = 4
+      label = "CHARGING"
+      if self.show_next && self.next_str != nil
+        label = "CHRG · >" + self.next_str
+      end
+      self.st_col = 0x00CCFF
+    else
+      self.st_id = 0
+      label = "PARKED"
+      if restr == "FROST"
+        label = "FROST GUARD"
+        self.st_col = 0x66CCFF
+      elif restr == "DAILY_LIMIT"
+        label = "DAILY LIMIT"
+      elif restr == "ALL_WORK_AREAS_COMPLETED"
+        label = "COMPLETED"
+        self.st_col = 0x22FF44
+      elif self.show_next && self.next_str != nil
+        label = "PARK · >" + self.next_str
+      end
+    end
+
+    self.line2 = label
+    store.set("st_id", self.st_id)
+    store.set("next_str", self.next_str)
+    store.set("m_name", self.m_name)
+    store.set("line2", self.line2)
+  end
+
+  def loop()
+    if self.app_key == "" || self.app_secret == "" return end
+    if self.tok_ttl > 0 self.tok_ttl -= 1 end
+    if self.ticks <= 0
+      if !self.in_flight
+        self.in_flight = true
+        if self.token == nil || self.tok_ttl <= 0
+          self.ticks = 20
+          if self.bat == nil self.line2 = "1/2 AUTH..." end
+          var b = "grant_type=client_credentials&client_id=" + self.app_key + "&client_secret=" + self.app_secret
+          http.post("https://api.authentication.husqvarnagroup.dev/v1/oauth2/token", b,
+                    / body, st -> self.on_token(body, st),
+                    {'headers': {'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json'}, 'cap': 4096})
+        else
+          self.ticks = self.period
+          http.get("https://api.amc.husqvarna.dev/v1/mowers",
+                   / body, st -> self.on_mower(body, st),
+                   {'headers': {'Authorization': "Bearer " + self.token, 'Authorization-Provider': 'husqvarna', 'X-Api-Key': self.app_key, 'Accept': 'application/vnd.api+json'}, 'cap': 8192})
+        end
+      end
+    else
+      self.ticks -= 1
+    end
+  end
+
+  def draw()
+    clear()
+    var w = width()
+    var t = now_ms() * self.spd / 100
+
+    # --- 1. Left 20x16 Live Diorama ---
+    rect_fill(0, 14, 20, 2, self.grass_col)
+
+    var mx = 3
+    var my = 9
+    var dir = 1
+
+    if self.st_id == 1
+      # Mowing: perfectly level glide with sub-pixel edge smoothing
+      var pos = 5.5 + 4.5 * math.sin(t / 550.0)
+      var c = math.cos(t / 550.0)
+      mx = int(pos)
+      dir = c >= 0 ? 1 : -1
+
+      # Uncut grass blades ahead of the mower
+      for gx : 0 .. 19
+        var tall = (dir > 0 && gx > mx + 7) || (dir < 0 && gx < mx)
+        if tall && (gx % 2 == 0)
+          line(gx, 12, gx, 13, self.grass_col)
+        end
+      end
+
+      # Smoothly ejected grass clippings behind the mower
+      for i : 0 .. 2
+        var ph = (t / 65 + i * 5) % 15
+        var px = dir > 0 ? mx - (ph / 3) : mx + 8 + (ph / 3)
+        var py = 13 - (ph / 4)
+        if px >= 0 && px < 20
+          pixel(px, py, 0x55FF66)
+        end
+      end
+    else
+      # Charging dock on the left edge (x = 0..4)
+      line(0, 5, 5, 5, 0x777788)
+      line(0, 6, 0, 13, 0x555566)
+      var d_led = self.st_id == 4 ? 0x00FFFF : 0x00FF44
+      pixel(1, 6, d_led)
+
+      for gx : 6 .. 19
+        if gx % 3 == 0 pixel(gx, 13, self.grass_col) end
+      end
+
+      if self.st_id == 2
+        # Returning to dock
+        mx = 11 - ((t / 140) % 10)
+        dir = -1
+        pixel(2 + ((t / 90) % 8), 10, 0xFFAA00)
+      elif self.st_id == 3
+        # Leaving dock
+        mx = 2 + ((t / 140) % 10)
+        dir = 1
+      elif self.st_id == 4
+        # Charging in dock: energy flow particles
+        mx = 2
+        for e : 0 .. 2
+          var ex = 1 + ((t / 70 + e * 3) % 8)
+          pixel(ex, 10, 0x00FFFF)
+        end
+        var by = 7 - ((t / 140) % 5)
+        pixel(6, by, 0x44FF88)
+        pixel(7, by - 1, 0x00FFFF)
+      elif self.st_id == 5
+        # EPOS / Planning: satellite radar waves
+        mx = 6
+        pixel(3, 1, 0xFFFFFF)
+        pixel(2, 1, 0x00CCFF)
+        pixel(4, 1, 0x00CCFF)
+        var r = (t / 110) % 9
+        circle(6, 1, r, 0x0088CC)
+      elif self.st_id == 6
+        # Error: pulsing warning beacon
+        mx = 6
+        var al = int(130 + 125 * math.sin(t / 140.0))
+        circle_fill(10, 4, 3, rgb(al, 0, 0))
+        line(10, 2, 10, 4, 0xFFFFFF)
+        pixel(10, 6, 0xFFFFFF)
+      else
+        # Parked: rising sleep particles ("Zzz")
+        mx = 2
+        for z : 0 .. 2
+          var zp = (t / 130 + z * 4) % 12
+          var zx = 8 + (zp / 2) + (z % 2)
+          var zy = 8 - (zp * 2 / 3)
+          var zv = clamp(220 - zp * 16, 30, 220)
+          pixel(zx, zy, rgb(zv / 2, zv / 2, zv))
+        end
+      end
+    end
+
+    # Automower 410XE NERA chassis (9x5 px, level at my = 9)
+    rect_fill(mx + 1, my + 1, 7, 3, 0x383C44)
+    line(mx + 2, my, mx + 6, my, self.body_col)
+    rect_fill(mx + 2, my + 1, 5, 1, self.body_col)
+    pixel(mx + (dir > 0 ? 8 : 0), my + 2, 0xCCFFFF)
+
+    # Wheels with smoothly rotating spoke
+    var sp = (self.st_id >= 1 && self.st_id <= 3) ? ((t / 120) % 2) : 0
+    rect_fill(mx + 1, my + 3, 2, 2, 0x181818)
+    rect_fill(mx + 6, my + 3, 2, 2, 0x181818)
+    pixel(mx + 1 + sp, my + 3, 0x999999)
+    pixel(mx + 6 + sp, my + 3, 0x999999)
+
+    # Smoothly rotating cutting disc shimmer under the deck while mowing
+    if self.st_id == 1
+      var bx = mx + 3 + ((t / 75) % 3)
+      pixel(bx, 13, 0xAAFFEE)
+    end
+
+    # Vertical divider between diorama and info
+    line(20, 1, 20, 14, 0x181822)
+
+    # --- 2. Right Info Zone (x = 22..51) ---
+    var b_col = 0x22FF44
+    if self.bat != nil
+      if self.bat <= 20 b_col = 0xFF2222
+      elif self.bat <= 50 b_col = 0xFFAA00 end
+    else
+      b_col = 0x888888
+    end
+
+    # Line 1: Battery percentage + battery icon
+    text(22, 6, self.bat_str, b_col)
+    rect(42, 1, 8, 5, 0x777777)
+    line(50, 2, 50, 3, 0x777777)
+    var fw = self.bat != nil ? (self.bat * 6 / 100) : 0
+    if self.st_id == 4
+      fw = (t / 180) % 7
+    end
+    if fw > 0
+      rect_fill(43, 2, fw, 3, b_col)
+    end
+
+    # Line 2: Status / Next start / Mower name
+    scroll_text(22, 13, w - 22, self.line2, self.st_col, self.sc_opts)
+
+    # Bottom row (y = 15): Animated progress/activity bar
+    var bw = w - 23
+    line(22, 15, w - 1, 15, 0x181818)
+    var fill_w = self.bat != nil ? (self.bat * bw / 100) : 0
+    if fill_w > 0
+      line(22, 15, 22 + fill_w - 1, 15, b_col)
+      if self.st_id >= 1 && self.st_id <= 4
+        var glow_x = 22 + ((t / 45) % fill_w)
+        pixel(glow_x, 15, 0xFFFFFF)
+      end
+    end
+  end
+
+  def on_button(btn)
+    if btn == "select"
+      self.ticks = 0
+      return true
+    end
+  end
+end
+
+return Automower()
